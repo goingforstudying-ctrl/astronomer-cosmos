@@ -1,87 +1,56 @@
 # Deploy-time preprocessing PoC — scoping doc
 
-**Status:** investigation in progress. Benchmark numbers pending — see the
-"Open benchmark work" section.
-
-This is an engineering scoping doc, not user-facing documentation. It lives
-outside the Sphinx toctree on purpose. The user-facing matrix is at
-`docs/optimize_performance/deploy_time_preprocessing.rst`.
+**Status:** investigation in progress; benchmark numbers pending. Engineering
+scoping doc, not user-facing — kept outside the Sphinx toctree. The
+user-facing matrix is at `docs/optimize_performance/deploy_time_preprocessing.rst`.
 
 ## Why this PoC exists
 
-Cosmos may (re)compute three dbt artefacts on every DAG parse or every task
-start:
+Cosmos may (re)compute three dbt artefacts on every DAG parse or task start:
 
 | Artefact | What it is | Where it's computed today |
 |---|---|---|
-| **dbt graph** | The Cosmos `DbtGraph` object (nodes + filtered_nodes), defined in `cosmos/dbt/graph.py:418` | `DbtGraph.load()` at DAG-parse time, called from `cosmos/converter.py:320-331`. Rebuilt on every parse regardless of `LoadMode`. |
-| **dbt_packages/** | dbt package install dir | `DbtGraph.run_dbt_deps()` (`cosmos/dbt/graph.py:824`) at parse time when `install_dbt_deps=True`; per-task when operator `install_deps=True` |
-| **partial_parse.msgpack** | dbt's own parse cache | dbt-internal; staged into temp run dirs by Cosmos at `cosmos/dbt/graph.py:912-920`; cached at `cosmos/cache.py:173-214` |
+| **dbt graph** | Cosmos `DbtGraph` object (nodes + filtered_nodes), `cosmos/dbt/graph.py:418` | `DbtGraph.load()` at parse, from `cosmos/converter.py:320-331`. Rebuilt on every parse regardless of `LoadMode`. |
+| **dbt_packages/** | dbt package install dir | `DbtGraph.run_dbt_deps()` (`cosmos/dbt/graph.py:824`) at parse when `install_dbt_deps=True`; per-task when operator `install_deps=True` |
+| **partial_parse.msgpack** | dbt's own parse cache | dbt-internal; staged into temp run dirs at `cosmos/dbt/graph.py:912-920`; cached at `cosmos/cache.py:173-214` |
 
-**Critical distinction for the dbt graph artefact:** the `DbtGraph` Cosmos
-object is *not* the same thing as `manifest.json`. `LoadMode.DBT_MANIFEST`
-precomputes the dbt-side *input* (manifest.json) but Cosmos still walks
-that input on every parse to construct the `DbtGraph`. The PoC's
-hypothesis is that the residual `DbtGraph` construction cost — the
-Cosmos-side work between reading the manifest and emitting Airflow tasks
-— is worth eliminating by shipping a serialised `DbtGraph` directly.
-
-Production deployments typically have multiple workers and many DAGs. Each
-of these artefacts has a slightly different cost surface, and the
-combination of `LoadMode` and `ExecutionMode` determines whether
-precomputing it actually helps. The PoC's first deliverable is to measure
-the headline cases and decide which ones are worth automating.
+Crucially, the Cosmos `DbtGraph` is *not* `manifest.json`. `LoadMode.DBT_MANIFEST`
+precomputes the dbt-side input but Cosmos still walks it on every parse to
+build the `DbtGraph`. The PoC asks whether the residual construction cost
+is worth eliminating via a serialised `DbtGraph`. First deliverable:
+measure headline cases and decide which artefacts are worth automating.
 
 ## Methodology
 
-Time is recorded for a single LOCAL DAG (`example_dbt_dag`) against the
-`fhir-dbt-analytics` project (185 models) in the `cosmos-benchmark`
-harness. The matrix in the user-facing doc is reasoned from the code, not
-measured cell-by-cell.
+Time recorded for a single LOCAL DAG (`example_dbt_dag`) against
+`fhir-dbt-analytics` (185 models) in `cosmos-benchmark`. Parse-time comes
+from `cosmos/converter.py:341`'s `It took %.3gs to parse the dbt project
+for DAG using ...` log in the DAG-processor pod; DAG runtime + worker
+CPU/memory from `run-complex-test.sh` → `post-process/report-dag-run-pool-metrics.sh`.
 
-Two surfaces matter:
+The log measures total `DbtGraph.load()` wall time. Four measurement pairs
+isolate dbt-side cost from Cosmos-side cost:
 
-- **Parse-time** — measured via `cosmos/converter.py:341`'s
-  `It took %.3gs to parse the dbt project for DAG using ...` log. Extract
-  from the DAG-processor pod's logs.
-- **DAG runtime + worker CPU/memory** — already collected by
-  `cosmos-benchmark`'s `run-complex-test.sh` →
-  `post-process/report-dag-run-pool-metrics.sh`.
-
-The `converter.py:341` log measures total `DbtGraph.load()` wall time. To
-isolate the Cosmos-side construction cost from the dbt-side input cost,
-we measure two pairs:
-
-1. **dbt graph — dbt-side cost (today's available win).** Baseline runs
-   `dbt ls` at parse (`LoadMode.DBT_LS`); precomputed variant has
-   `RUN dbt parse` in the Dockerfile and switches the DAG to
-   `LoadMode.DBT_MANIFEST`. Delta = dbt-invocation cost saved.
-2. **dbt graph — Cosmos-side construction floor.** With `LoadMode.DBT_MANIFEST`
-   in place, the `converter.py:341` time is the residual cost of building
-   the `DbtGraph` from the prebuilt manifest. This is the floor a future
-   serialised-`DbtGraph` mechanism would aim to push toward zero. We do
-   not have a code-side prototype yet; the number tells us whether it's
-   worth building one.
-3. **dbt_packages.** Baseline pre-installs via `RUN dbt deps` (already
-   present in the upstream Dockerfile); without-precomputation variant
+1. **dbt graph, dbt-side win.** Baseline `LoadMode.DBT_LS`; variant adds
+   `RUN dbt parse` + `LoadMode.DBT_MANIFEST`. Delta = dbt-invocation cost.
+2. **dbt graph, Cosmos-side floor.** Under `LoadMode.DBT_MANIFEST` the log
+   time is the residual cost of building `DbtGraph` from a prebuilt
+   manifest — the floor a serialised-`DbtGraph` mechanism would aim
+   toward zero. Tells us whether to build one.
+3. **dbt_packages.** Baseline pre-installs via `RUN dbt deps`; variant
    removes that line and sets `install_dbt_deps=True`.
-4. **partial_parse.** Baseline keeps `target/partial_parse.msgpack`
-   alongside the manifest; without-precomputation variant adds a final
-   `RUN rm -f target/partial_parse.msgpack`. If signal is zero under
-   `LoadMode.DBT_MANIFEST` (expected, since dbt isn't invoked at parse),
-   re-run the toggle under `LoadMode.DBT_LS` to isolate the cold-deploy
-   effect.
+4. **partial_parse.** Baseline keeps `target/partial_parse.msgpack`;
+   variant appends `RUN rm -f target/partial_parse.msgpack`. If signal is
+   zero under `DBT_MANIFEST` (expected — dbt isn't invoked at parse),
+   re-run under `DBT_LS` to isolate the cold-deploy effect.
 
 ## Open benchmark work
 
-These are the concrete changes needed in `astronomer/cosmos-benchmark` to
-produce the numbers. They are *not* applied yet — they require BigQuery
-credentials and a local kind cluster (`~10 vCPU / 20 GiB`) the author
-doesn't have set up.
+Changes needed in `astronomer/cosmos-benchmark`. Not applied — require
+BigQuery credentials + a local kind cluster (`~10 vCPU / 20 GiB`) the
+author doesn't have set up.
 
 ### Change 1 — `benchmark/Dockerfile`: build-arg toggles
-
-Replace the existing fixed `RUN dbt deps` line with build-arg-gated steps:
 
 ```dockerfile
 ARG PRECOMPUTE_DEPS=1
@@ -95,29 +64,23 @@ RUN if [ "$PRECOMPUTE_MANIFEST" = "1" ] && [ "$PRECOMPUTE_PARTIAL_PARSE" = "0" ]
     fi
 ```
 
-Build the six images with distinct tags, e.g.:
+Build six images:
 
 ```bash
 docker build --build-arg PRECOMPUTE_DEPS=0 -t cosmos-bench:no-deps .
-docker build --build-arg PRECOMPUTE_DEPS=1 -t cosmos-bench:with-deps .          # current upstream baseline
+docker build --build-arg PRECOMPUTE_DEPS=1 -t cosmos-bench:with-deps .          # current baseline
 docker build --build-arg PRECOMPUTE_MANIFEST=1 -t cosmos-bench:with-manifest .
-docker build --build-arg PRECOMPUTE_MANIFEST=0 -t cosmos-bench:no-manifest .    # same as with-deps above
+docker build --build-arg PRECOMPUTE_MANIFEST=0 -t cosmos-bench:no-manifest .    # same as with-deps
 docker build --build-arg PRECOMPUTE_MANIFEST=1 --build-arg PRECOMPUTE_PARTIAL_PARSE=1 -t cosmos-bench:with-pp .
 docker build --build-arg PRECOMPUTE_MANIFEST=1 --build-arg PRECOMPUTE_PARTIAL_PARSE=0 -t cosmos-bench:no-pp .
 ```
 
-Note: this measures the **dbt-side** component of the dbt-graph artefact
-(manifest precomputation). The **Cosmos-side** component (serialised
-`DbtGraph`) is not measured here because no such mechanism exists yet —
-the `LoadMode.DBT_MANIFEST` parse-time number gives us the floor that a
-serialised-`DbtGraph` mechanism would need to beat to be worth building.
+Covers the dbt-side component only — measurement 2 needs no Dockerfile
+change since no serialised-`DbtGraph` mechanism exists yet.
 
 ### Change 2 — `benchmark/dags/cosmos_dags.py`: manifest variant
 
-The existing DAG uses `install_dbt_deps=False` and the default LoadMode
-(AUTOMATIC, no manifest_path → falls back to DBT_LS). Make it
-env-toggleable so the same DAG file can drive both the with-manifest and
-without-manifest runs:
+Make the existing DAG env-toggleable:
 
 ```python
 import os
@@ -126,7 +89,6 @@ from cosmos.constants import LoadMode
 
 DBT_PROJECT_PATH = Path(__file__).parent.parent
 USE_MANIFEST = os.getenv("COSMOS_BENCH_USE_MANIFEST", "0") == "1"
-
 manifest_path = (DBT_PROJECT_PATH / "target" / "manifest.json") if USE_MANIFEST else None
 load_method = LoadMode.DBT_MANIFEST if USE_MANIFEST else LoadMode.DBT_LS
 
@@ -135,14 +97,12 @@ project_config = ProjectConfig(
     install_dbt_deps=os.getenv("COSMOS_BENCH_INSTALL_DEPS", "0") == "1",
     manifest_path=manifest_path,
 )
-
-# in DbtDag(...):
-render_config=RenderConfig(test_behavior=TestBehavior.NONE, load_method=load_method),
+render_config = RenderConfig(test_behavior=TestBehavior.NONE, load_method=load_method)
 ```
 
-### Change 3 — `benchmark/post-process/report-parse-time.sh`: new script
+### Change 3 — `benchmark/post-process/report-parse-time.sh`
 
-A thin extractor that mirrors `report-dag-run-pool-metrics.sh`'s shape:
+Extractor mirroring `report-dag-run-pool-metrics.sh`:
 
 ```bash
 #!/usr/bin/env bash
@@ -155,193 +115,100 @@ kubectl --context kind-kind -n airflow logs \
   | grep -F "Cosmos performance" \
   | grep -F "($DAG_ID)" \
   | sed -E 's/.* It took ([0-9.]+)s to parse the dbt project for DAG using (.+)$/\1,\2/' \
-  | tail -1   # last parse in the window
+  | tail -1
 ```
 
-`run-complex-test.sh` then appends the result to `$METRICS_CSV`. New
-columns: `parse_time_s, load_mode`.
+`run-complex-test.sh` appends to `$METRICS_CSV` with new columns
+`parse_time_s, load_mode`.
 
-### Change 4 — `benchmark/results/preprocessing-poc.csv`: committed numbers
+### Change 4 — `benchmark/results/preprocessing-poc.csv`
 
-After the six runs, commit the CSV in-repo so it stays linked from this
-scoping doc.
+After the six runs, commit the CSV in-repo so it stays linked from this doc.
 
-## Per-artefact recommendation (preliminary)
+## Automation mechanisms (preliminary)
 
-To be finalised once numbers land. Preliminary read from code:
+Mechanisms for shipping artefacts; per-artefact gating is in "Sub-tickets".
 
-### dbt graph (the `DbtGraph` object)
+- **Otto / Astro CLI deploy hook.** Build-time hook runs `dbt deps && dbt parse`
+  (later, a serialised-`DbtGraph` dump) and ships artefacts in the image.
+  Pro: no Cosmos code change today; reuses an Astronomer pathway. Con:
+  Astronomer-only; can't carry serialised-`DbtGraph` until Cosmos defines
+  the format. Verdict: candidate for sub-ticket #1 (docs + recipe).
+- **`AstroBundleBackend` wrapped as `DbtDagBundle`.** Cosmos-owned
+  `DagBundle` subclass bundling DAG files + preprocessed artefacts via
+  Airflow 3's `DagBundleModel` — manifest + `dbt_packages/` + partial_parse
+  today, plus serialised `DbtGraph` once defined. Pro: OSS-friendly;
+  `DagBundleModel` already imported in `tests/utils.py:54-67`; decoupled
+  from Astro CLI; natural home for serialised-`DbtGraph`. Con: Airflow 3
+  only (Cosmos still supports 2.x); new public API surface; bundle
+  versioning + refresh semantics need design. Verdict: candidate for
+  sub-ticket #3, only if numbers justify.
+- **Monkey-patch DAG-processor caching.** At Cosmos import, patch
+  Airflow's DAG processor so re-parses of unchanged files skip
+  `DbtGraph.load()` and reuse a memoised graph. Pro: no API change;
+  potentially fast low-touch win. Con: fragile across Airflow versions;
+  duplicates `cosmos/cache.py`'s purpose with a hidden second layer
+  likely to surface as "stale DAG" bugs; version-pinned patches + CI
+  matrix expansion. Verdict: **rejected** unless measurement shows
+  `DBT_LS_CACHE` + `DBT_MANIFEST` still leave a measurable gap.
 
-- **Today's mechanism (`LoadMode.DBT_MANIFEST`)** is the largest piece of
-  the available win and is already supported by Cosmos. Worth automating
-  the *deploy step* (CI hook / Dockerfile / DAG bundle) so users don't
-  have to wire it themselves.
-- **Serialising the `DbtGraph` itself** is the deeper opportunity. If the
-  Step-2 measurement shows non-trivial residual cost in `DbtGraph.load()`
-  under `LoadMode.DBT_MANIFEST` (i.e. the floor is far from zero), it's
-  worth prototyping a new `LoadMode` (`LoadMode.DBT_GRAPH_PICKLE` or
-  similar) that pickles `DbtGraph.nodes` / `tests_per_model` /
-  `filtered_nodes` at deploy time and unpickles at parse. Skip if the
-  floor is already near-zero.
-- **Caveat for both:** users on `LoadMode.DBT_LS_CACHE` already get most
-  of the dbt-side benefit on warm cache. The win shows up on cold deploys
-  and frequent cache misses.
+## Sub-tickets (preliminary)
 
-### dbt_packages
+PR-ready once numbers are in; update placeholders before posting.
 
-- **Worth automating only when ``install_dbt_deps=True`` or operators have
-  ``install_deps=True``.** The current cosmos-benchmark baseline already
-  does this preprocessing (image-time `dbt deps`). For users who don't
-  control their image, packaging this as a `DbtDagBundle` would matter.
-
-### partial_parse
-
-- **Likely documentation only.** Under `LoadMode.DBT_MANIFEST` (the
-  recommended path), the partial_parse file has no parse-time effect.
-  Under `LoadMode.DBT_LS` it does, but those users should arguably move
-  to `DBT_MANIFEST` instead. Keep as opportunistic, not automated.
-
-## Evaluation of automation paths
-
-Three approaches called out in the originating ticket. Each evaluated
-against: (a) what existing Cosmos/Airflow surface it touches, (b) blast
-radius and risk, (c) maintenance burden. Note that these are the
-*mechanisms* for shipping any of the three artefacts; the per-artefact
-recommendation above decides *which* artefacts to ship.
-
-### Otto / Astro CLI deploy hook
-
-- **What it is:** Use the Astro CLI's existing build-time hook surface to
-  run `dbt deps && dbt parse` (and optionally a future serialised-`DbtGraph`
-  dump) at deploy time, then ship the artefacts in the image.
-- **Pros:** No Cosmos code change required for today's mechanism. Reuses
-  an already-supported Astronomer pathway. Users already familiar with
-  Astro CLI workflows inherit it cleanly.
-- **Cons:** Tied to Astronomer's CLI; OSS users on plain Airflow get no
-  benefit. Documentation-only contribution from the Cosmos side. Cannot
-  carry the serialised-`DbtGraph` artefact until Cosmos defines that
-  format.
-- **Cosmos changes:** none required for today's manifest-based path; just
-  a docs note. For serialised-`DbtGraph`, Cosmos needs to ship the
-  serialisation format first.
-- **Verdict:** Candidate for sub-ticket #1 (documentation + reference
-  recipe).
-
-### `AstroBundleBackend` wrapped as `DbtDagBundle`
-
-- **What it is:** Provide a Cosmos-owned `DagBundle` subclass that bundles
-  DAG files together with their preprocessed dbt artefacts, leveraging
-  Airflow 3's `DagBundleModel`. Could ship manifest + `dbt_packages/` +
-  partial_parse today, and a serialised `DbtGraph` once that format
-  exists.
-- **Pros:** OSS-friendly; works for any Airflow 3 user, not just Astro.
-  Cosmos already imports `DagBundleModel` in `tests/utils.py:54-67` for
-  test infrastructure, so the dependency is already in scope.
-  Decouples preprocessing from the Astro CLI specifically. Natural home
-  for a future serialised-`DbtGraph` artefact.
-- **Cons:** Airflow 3 only (Cosmos still supports 2.x). Requires Cosmos
-  to own a new public API surface. Bundle versioning and refresh
-  semantics need design.
-- **Cosmos changes:** new module (`cosmos/bundles/`?), new tests, docs.
-- **Verdict:** Candidate for sub-ticket #3 (mechanism), opened *only* if
-  the headline benchmark numbers justify the surface area.
-
-### Monkey-patch DAG-processor caching
-
-- **What it is:** At Cosmos import time, patch Airflow's DAG processor so
-  that re-parses of an unchanged DAG file skip the Cosmos `DbtGraph.load()`
-  call and reuse a memoised `DbtGraph` from the previous parse in the same
-  process. This is effectively an in-process cache of the constructed
-  `DbtGraph` object.
-- **Pros:** Avoids any user-facing API change. Could be a fast, low-touch
-  win for the `DbtGraph` construction cost specifically.
-- **Cons:** Monkey-patching Airflow internals is fragile across Airflow
-  versions and intersects with Airflow's own DAG parsing model in
-  non-obvious ways. Cosmos already has a deliberate caching layer
-  (`cosmos/cache.py`) for the same purpose; adding a second, hidden
-  caching layer at the Airflow level risks divergence and is likely to
-  surface as "stale DAG" bugs after deploys.
-- **Cosmos changes:** Airflow-version-pinned patches; CI matrix expansion.
-- **Verdict:** Recommend **rejected** unless the Step-2 measurement shows
-  that `LoadMode.DBT_LS_CACHE` and `LoadMode.DBT_MANIFEST` together still
-  leave a measurable parse-time gap that justifies the risk. Document the
-  reasoning in the sub-ticket either way.
-
-## Draft sub-tickets
-
-The titles and one-paragraph descriptions below are PR-ready once the
-numbers are in. Update the numeric placeholders before posting.
-
-### 1. Document deploy-time preprocessing pattern and Astro CLI recipe
-
-Add a worked example to `docs/optimize_performance/deploy_time_preprocessing.rst`
-showing how to run `dbt deps && dbt parse` as part of an Astro CLI deploy
-hook, ship the resulting `target/manifest.json` and `dbt_packages/`, and
-configure `ProjectConfig(manifest_path=..., install_dbt_deps=False)` with
-`RenderConfig(load_method=LoadMode.DBT_MANIFEST)`. Validate against
-`fhir-dbt-analytics` in `cosmos-benchmark`; cite the dbt-side parse-time
-reduction (TBD). Lowest-risk, OSS-compatible win. Sub-ticket #1 covers
-the *dbt-side* portion of the dbt-graph artefact only.
-
-### 2. (Conditional) Prototype serialised `DbtGraph` LoadMode
-
-Only if the Step-2 measurement shows non-trivial residual `DbtGraph.load()`
-time under `LoadMode.DBT_MANIFEST`. Add a new `LoadMode.DBT_GRAPH_PICKLE`
-(or similar) that pickles `DbtGraph.nodes`, `tests_per_model`,
-`filtered_nodes`, and `load_method` at deploy time and unpickles at
-parse — skipping the manifest walk entirely. The shipped artefact format
-should be versioned and validated against the dbt-project hash so a stale
-graph can't be silently loaded after the project changes. Skip if the
-residual cost is already near-zero.
-
-### 3. (Conditional) Provide a `DbtDagBundle` for Airflow 3 DAG bundles
-
-Implement a Cosmos-owned subclass of Airflow 3's `DagBundleModel` that
-ships dbt artefacts (`manifest.json`, `dbt_packages/`, optionally
-`partial_parse.msgpack`, and the serialised `DbtGraph` from sub-ticket #2
-if it lands) alongside DAG files. Includes versioning, refresh
-semantics, and reuse of the existing `cosmos/cache.py` for the
-artefact-staging step. Only open after sub-ticket #1 lands and benchmark
-numbers justify the API surface. Airflow 3 only; gate behind a feature
-flag while we still support 2.x.
-
-### 4. (Conditional) Pre-stage `partial_parse.msgpack` for `DBT_LS` users
-
-Only if the Step-4 numbers show a non-trivial parse-time delta under
-`LoadMode.DBT_LS` after shipping `partial_parse.msgpack`. Either extend
-`cosmos/cache.py` to stage a shipped partial_parse into the temp run
-directory automatically, or document the pattern. Default: documentation
-only; promote to code if the delta is large.
-
-### 5. (Rejected unless numbers justify) Monkey-patch DAG processor
-
-Only open if all of the above plus `LoadMode.DBT_LS_CACHE` still leave a
-measurable parse-time gap. Patch Airflow's DAG-processor caching to skip
-`DbtGraph.load()` on unchanged DAG files. Document the staleness contract
-explicitly. Pin to a specific Airflow version range in CI.
+1. **Document deploy-time preprocessing + Astro CLI recipe.** Artefact:
+   dbt graph (dbt-side). Gate: unconditional — lowest-risk OSS-compatible
+   win. Worked example in `docs/optimize_performance/deploy_time_preprocessing.rst`
+   showing `dbt deps && dbt parse` in an Astro CLI hook, shipping
+   `target/manifest.json` + `dbt_packages/`, with
+   `ProjectConfig(manifest_path=..., install_dbt_deps=False)` and
+   `RenderConfig(load_method=LoadMode.DBT_MANIFEST)`. Validate against
+   `fhir-dbt-analytics`; cite parse-time reduction (TBD). Caveat: users on
+   `LoadMode.DBT_LS_CACHE` already get most of the dbt-side benefit on
+   warm cache — the win shows up on cold deploys and frequent misses.
+2. **(Conditional) Prototype serialised `DbtGraph` LoadMode.** Artefact:
+   dbt graph (Cosmos-side floor). Gate: only if measurement 2 shows
+   non-trivial residual `DbtGraph.load()` time under `LoadMode.DBT_MANIFEST`.
+   Add `LoadMode.DBT_GRAPH_PICKLE` (or similar) that pickles
+   `DbtGraph.nodes`, `tests_per_model`, `filtered_nodes`, `load_method` at
+   deploy and unpickles at parse, skipping the manifest walk. Versioned
+   format validated against a dbt-project hash to prevent stale loads.
+3. **(Conditional) Provide a `DbtDagBundle` for Airflow 3.** Artefact: all
+   three (+ serialised `DbtGraph` if #2 lands). Gate: after #1 lands and
+   numbers justify the API surface. Cosmos-owned `DagBundleModel` subclass
+   shipping artefacts alongside DAG files, with versioning, refresh
+   semantics, and reuse of `cosmos/cache.py` for staging. Airflow 3 only;
+   feature-flag while 2.x is still supported. Also covers `dbt_packages`
+   for users who don't control their image.
+4. **(Conditional) Pre-stage `partial_parse.msgpack` for `DBT_LS` users.**
+   Artefact: partial_parse. Gate: only if measurement 4 under
+   `LoadMode.DBT_LS` shows a non-trivial delta — under `DBT_MANIFEST` the
+   file has no parse-time effect. Either extend `cosmos/cache.py` to stage
+   a shipped file automatically, or document the pattern. Default: docs
+   only; promote to code if the delta is large.
+5. **(Rejected unless numbers justify) Monkey-patch DAG processor.**
+   Artefact: dbt graph (Cosmos-side). Gate: only if #1–#4 plus
+   `LoadMode.DBT_LS_CACHE` still leave a measurable gap. Patch Airflow's
+   DAG-processor caching to skip `DbtGraph.load()` on unchanged DAG
+   files; document the staleness contract explicitly; pin to a specific
+   Airflow version range in CI.
 
 ## Code-location references
 
-For future readers — these are the locations the user-facing doc and this
-scoping doc are derived from. Verify they still exist before treating any
-specific recommendation as load-bearing:
+Verify these still exist before treating any recommendation as load-bearing.
 
-- `cosmos/constants.py:72-82` — `LoadMode` enum
-- `cosmos/constants.py:98-113` — `ExecutionMode` enum
-- `cosmos/constants.py:23` — `DBT_PARTIAL_PARSE_FILE_NAME`
-- `cosmos/converter.py:320-347` — graph load + timing log
-- `cosmos/dbt/graph.py:418` — `DbtGraph` class (the Cosmos-side dbt graph)
-- `cosmos/dbt/graph.py` `DbtGraph.load()` — dispatch by LoadMode
-- `cosmos/dbt/graph.py` `DbtGraph.run_dbt_deps()` — dbt deps runner
-- `cosmos/dbt/graph.py` `load_via_dbt_ls_without_cache()` — DBT_LS path
-- `cosmos/cache.py` — Cosmos-side caching layer
-- `tests/utils.py:54-67` — existing `DagBundleModel` usage in tests
-- `docs/faq.rst` — existing deploy-time-preprocessing recommendation
-- `docs/optimize_performance/optimize_rendering.rst` — parse-time knobs
-- `docs/optimize_performance/caching.rst` — caching layer details
-
-Upstream benchmark harness:
-
-- `github.com/astronomer/cosmos-benchmark` — `benchmark/Dockerfile`,
-  `benchmark/dags/cosmos_dags.py`, `benchmark/run-complex-test.sh`,
+- **Constants/enums:** `cosmos/constants.py:72-82` (`LoadMode`),
+  `cosmos/constants.py:98-113` (`ExecutionMode`), `cosmos/constants.py:23`
+  (`DBT_PARTIAL_PARSE_FILE_NAME`).
+- **Parse + graph path:** `cosmos/converter.py:320-347` (graph load + timing
+  log), `cosmos/dbt/graph.py:418` (`DbtGraph`), `cosmos/dbt/graph.py`
+  (`DbtGraph.load()`, `DbtGraph.run_dbt_deps()`,
+  `load_via_dbt_ls_without_cache()`), `cosmos/cache.py` (caching layer),
+  `tests/utils.py:54-67` (existing `DagBundleModel` usage).
+- **Related docs:** `docs/faq.rst`,
+  `docs/optimize_performance/optimize_rendering.rst`,
+  `docs/optimize_performance/caching.rst`.
+- **Upstream benchmark harness:** `github.com/astronomer/cosmos-benchmark` —
+  `benchmark/Dockerfile`, `benchmark/dags/cosmos_dags.py`,
+  `benchmark/run-complex-test.sh`,
   `benchmark/post-process/report-dag-run-pool-metrics.sh`.
