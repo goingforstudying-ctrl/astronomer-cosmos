@@ -15,6 +15,7 @@ The following pages cover specific optimization mechanisms in more detail:
 - :ref:`memory-optimization` -- Reduce memory consumption during DAG parsing and task execution.
 - :ref:`caching` -- How Cosmos caches dbt ls output, partial parse files, profiles, and YAML selectors.
 - :ref:`invocation-mode` -- Choose between running dbt as a library or as a subprocess.
+- :ref:`deploy-time-preprocessing` -- Precompute dbt artefacts at deploy time and the LoadMode x ExecutionMode applicability matrix.
 
 .. toctree::
    :maxdepth: 1
@@ -26,3 +27,4 @@ The following pages cover specific optimization mechanisms in more detail:
    memory_optimization
    caching
    invocation_mode
+   deploy_time_preprocessing
