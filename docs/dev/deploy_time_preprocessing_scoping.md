@@ -89,7 +89,9 @@ from cosmos.constants import LoadMode
 
 DBT_PROJECT_PATH = Path(__file__).parent.parent
 USE_MANIFEST = os.getenv("COSMOS_BENCH_USE_MANIFEST", "0") == "1"
-manifest_path = (DBT_PROJECT_PATH / "target" / "manifest.json") if USE_MANIFEST else None
+manifest_path = (
+    (DBT_PROJECT_PATH / "target" / "manifest.json") if USE_MANIFEST else None
+)
 load_method = LoadMode.DBT_MANIFEST if USE_MANIFEST else LoadMode.DBT_LS
 
 project_config = ProjectConfig(
