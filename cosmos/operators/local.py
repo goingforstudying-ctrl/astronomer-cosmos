@@ -244,6 +244,8 @@ class AbstractDbtLocalBase(AbstractDbtBase):
         # as it can break existing DAGs.
         self.append_env = append_env
 
+        self._warn_on_output_only_fields(kwargs)
+
         # Preserve the raw value (including Jinja templated strings) so Airflow can render the template
         # field at execution time; the effective boolean is resolved by ``self._should_install_deps()``.
         # Skip the filesystem probe when deps are explicitly disabled to avoid extra per-task I/O at parse time.
@@ -950,8 +952,6 @@ class DbtLocalBaseOperator(AbstractDbtLocalBase, BaseOperator):
         operator_args = {*inspect.signature(BaseOperator.__init__).parameters.keys()}
 
         default_args = kwargs.get("default_args", {})
-
-        self._warn_on_output_only_fields(kwargs)
 
         for arg in operator_args:
             try:
